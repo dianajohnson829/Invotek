@@ -13,6 +13,13 @@
 (define-constant ERR_BATCH_SIZE_EXCEEDED (err u111))
 (define-constant ERR_BATCH_EMPTY (err u112))
 (define-constant ERR_BATCH_VALIDATION_FAILED (err u113))
+(define-constant ERR_AUCTION_NOT_FOUND (err u114))
+(define-constant ERR_AUCTION_ENDED (err u115))
+(define-constant ERR_AUCTION_NOT_ENDED (err u116))
+(define-constant ERR_BID_TOO_LOW (err u117))
+(define-constant ERR_AUCTION_ALREADY_EXISTS (err u118))
+(define-constant ERR_INVALID_AUCTION_DURATION (err u119))
+(define-constant ERR_CANNOT_BID_ON_OWN_AUCTION (err u120))
 
 (define-data-var next-invoice-id uint u1)
 (define-data-var dao-fee-percentage uint u250)
@@ -64,7 +71,35 @@
   }
 )
 
+(define-map invoice-auctions
+  { auction-id: uint }
+  {
+    invoice-id: uint,
+    seller: principal,
+    start-price: uint,
+    reserve-price: uint,
+    current-bid: uint,
+    current-bidder: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    total-bids: uint,
+    is-active: bool
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal, bid-index: uint }
+  {
+    bid-amount: uint,
+    bid-block: uint
+  }
+)
+
 (define-data-var next-batch-id uint u1)
+(define-data-var next-auction-id uint u1)
+(define-data-var min-bid-increment uint u1000)
+(define-data-var min-auction-duration uint u144)
+(define-data-var max-auction-duration uint u4320)
 
 (define-public (create-invoice (debtor principal) (amount uint) (due-date uint) (description (string-ascii 256)))
   (let
@@ -579,3 +614,206 @@
 (define-read-only (get-next-batch-id)
   (var-get next-batch-id)
 )
+
+(define-public (create-auction (invoice-id uint) (start-price uint) (reserve-price uint) (duration-blocks uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) ERR_INVOICE_NOT_FOUND))
+      (auction-id (var-get next-auction-id))
+      (current-block stacks-block-height)
+      (end-block (+ current-block duration-blocks))
+    )
+    (asserts! (is-eq (get current-owner invoice) tx-sender) ERR_NOT_INVOICE_OWNER)
+    (asserts! (not (get is-paid invoice)) ERR_INVOICE_ALREADY_PAID)
+    (asserts! (not (get for-sale invoice)) ERR_INVOICE_ALREADY_EXISTS)
+    (asserts! (> start-price u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= reserve-price start-price) ERR_INVALID_AMOUNT)
+    (asserts! (>= duration-blocks (var-get min-auction-duration)) ERR_INVALID_AUCTION_DURATION)
+    (asserts! (<= duration-blocks (var-get max-auction-duration)) ERR_INVALID_AUCTION_DURATION)
+
+    (map-set invoice-auctions
+      { auction-id: auction-id }
+      {
+        invoice-id: invoice-id,
+        seller: tx-sender,
+        start-price: start-price,
+        reserve-price: reserve-price,
+        current-bid: u0,
+        current-bidder: none,
+        start-block: current-block,
+        end-block: end-block,
+        total-bids: u0,
+        is-active: true
+      }
+    )
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { for-sale: true, sale-price: start-price })
+    )
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let
+    (
+      (auction (unwrap! (map-get? invoice-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (current-block stacks-block-height)
+      (current-bid (get current-bid auction))
+      (min-bid (if (is-eq current-bid u0) 
+                   (get start-price auction)
+                   (+ current-bid (var-get min-bid-increment))))
+      (total-bids (get total-bids auction))
+      (bid-index total-bids)
+    )
+    (asserts! (get is-active auction) ERR_AUCTION_ENDED)
+    (asserts! (< current-block (get end-block auction)) ERR_AUCTION_ENDED)
+    (asserts! (not (is-eq tx-sender (get seller auction))) ERR_CANNOT_BID_ON_OWN_AUCTION)
+    (asserts! (>= bid-amount min-bid) ERR_BID_TOO_LOW)
+    (asserts! (>= (stx-get-balance tx-sender) bid-amount) ERR_INSUFFICIENT_FUNDS)
+    (map-set auction-bids
+      { auction-id: auction-id, bidder: tx-sender, bid-index: bid-index }
+      {
+        bid-amount: bid-amount,
+        bid-block: current-block
+      }
+    )
+    (map-set invoice-auctions
+      { auction-id: auction-id }
+      (merge auction {
+        current-bid: bid-amount,
+        current-bidder: (some tx-sender),
+        total-bids: (+ total-bids u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (end-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? invoice-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (current-block stacks-block-height)
+      (invoice-id (get invoice-id auction))
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) ERR_INVOICE_NOT_FOUND))
+      (current-bid (get current-bid auction))
+      (reserve-price (get reserve-price auction))
+      (seller (get seller auction))
+    )
+    (asserts! (get is-active auction) ERR_AUCTION_ENDED)
+    (asserts! (>= current-block (get end-block auction)) ERR_AUCTION_NOT_ENDED)
+    (if (and (> current-bid u0) (>= current-bid reserve-price))
+      (let
+        (
+          (winner (unwrap! (get current-bidder auction) ERR_AUCTION_NOT_FOUND))
+          (dao-fee (/ (* current-bid (var-get dao-fee-percentage)) u10000))
+          (seller-amount (- current-bid dao-fee))
+        )
+        (try! (stx-transfer? seller-amount winner seller))
+        (var-set dao-treasury (+ (var-get dao-treasury) dao-fee))
+        (map-set invoices
+          { invoice-id: invoice-id }
+          (merge invoice {
+            current-owner: winner,
+            for-sale: false,
+            sale-price: u0
+          })
+        )
+        (map-set user-stats
+          { user: winner }
+          (merge
+            (default-to { invoices-issued: u0, invoices-purchased: u0, total-volume: u0 }
+                       (map-get? user-stats { user: winner }))
+            {
+              invoices-purchased: (+ (get invoices-purchased (default-to { invoices-issued: u0, invoices-purchased: u0, total-volume: u0 }
+                                                                         (map-get? user-stats { user: winner }))) u1),
+              total-volume: (+ (get total-volume (default-to { invoices-issued: u0, invoices-purchased: u0, total-volume: u0 }
+                                                             (map-get? user-stats { user: winner }))) current-bid)
+            }
+          )
+        )
+        (map-set invoice-auctions
+          { auction-id: auction-id }
+          (merge auction { is-active: false })
+        )
+        (ok true)
+      )
+      (begin
+        (map-set invoices
+          { invoice-id: invoice-id }
+          (merge invoice { for-sale: false, sale-price: u0 })
+        )
+        (map-set invoice-auctions
+          { auction-id: auction-id }
+          (merge auction { is-active: false })
+        )
+        (ok false)
+      )
+    )
+  )
+)
+
+(define-public (cancel-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (map-get? invoice-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+      (invoice-id (get invoice-id auction))
+      (invoice (unwrap! (map-get? invoices { invoice-id: invoice-id }) ERR_INVOICE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get seller auction)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-active auction) ERR_AUCTION_ENDED)
+    (asserts! (is-eq (get total-bids auction) u0) ERR_NOT_AUTHORIZED)
+    (map-set invoices
+      { invoice-id: invoice-id }
+      (merge invoice { for-sale: false, sale-price: u0 })
+    )
+    (map-set invoice-auctions
+      { auction-id: auction-id }
+      (merge auction { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-auction-parameters (new-min-increment uint) (new-min-duration uint) (new-max-duration uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-min-increment u0) ERR_INVALID_AMOUNT)
+    (asserts! (> new-min-duration u0) ERR_INVALID_AUCTION_DURATION)
+    (asserts! (> new-max-duration new-min-duration) ERR_INVALID_AUCTION_DURATION)
+    (var-set min-bid-increment new-min-increment)
+    (var-set min-auction-duration new-min-duration)
+    (var-set max-auction-duration new-max-duration)
+    (ok true)
+  )
+)
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? invoice-auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal) (bid-index uint))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder, bid-index: bid-index })
+)
+
+(define-read-only (get-auction-parameters)
+  {
+    min-bid-increment: (var-get min-bid-increment),
+    min-auction-duration: (var-get min-auction-duration),
+    max-auction-duration: (var-get max-auction-duration),
+    next-auction-id: (var-get next-auction-id)
+  }
+)
+
+(define-read-only (is-auction-active (auction-id uint))
+  (match (map-get? invoice-auctions { auction-id: auction-id })
+    auction (and (get is-active auction) (< stacks-block-height (get end-block auction)))
+    false
+  )
+)
+
+
+
+
