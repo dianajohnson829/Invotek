@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Invotek.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.invoice-rating]
+path = 'contracts/invoice-rating.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
